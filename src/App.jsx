@@ -22,6 +22,7 @@ const TICK_REAL_MS = 120;
 const TICK_SIM_MS = 120; // 1:1 scale — 10s SLA plays out over 10 real seconds
 const MAX_PAYMENTS = 60;
 const STABILITY_GAP_MS = 4000; // no new breach for this long before we'll consider closing
+const BACKLOG_SAMPLE_MS = 500; // trend-sample cadence for the Executive/Resilience sparklines
 
 const STATE_LABELS = { HEALTHY: "Healthy", DEGRADING: "Degrading", RECOVERING: "Recovering", STABLE: "Stable" };
 
@@ -69,6 +70,10 @@ function createInitialSim() {
     alertLevel: "NONE",
     alertLevelSince: 0,
     lastBreachTime: null,
+    terminalDurations: [],
+    backlogHistory: [],
+    lastBacklogSampleTime: 0,
+    impactToleranceMs: 60000,
   };
 }
 
@@ -160,6 +165,8 @@ function stepSimulation(sim, dtMs) {
         p.terminalOutcome = "COMPLETED";
         p.terminalAt = t;
         if (sim.scenarioState === "RECOVERING") sim.completedSinceRecovery += 1;
+        sim.terminalDurations.push({ duration: t - p.acceptedAt, outcome: "COMPLETED", t });
+        if (sim.terminalDurations.length > 200) sim.terminalDurations.shift();
         continue;
       }
       const stage = STAGES[p.stageIndex];
@@ -180,6 +187,8 @@ function stepSimulation(sim, dtMs) {
         p.terminalStageIndex = p.stageIndex;
         sim.lastBreachTime = t;
         if (sim.firstBreachTime == null) sim.firstBreachTime = t;
+        sim.terminalDurations.push({ duration: elapsed, outcome: "TIMED_OUT", t });
+        if (sim.terminalDurations.length > 200) sim.terminalDurations.shift();
         const ev = p.events[p.events.length - 1];
         ev.endedAt = t;
         ev.durationMs = t - ev.enteredAt;
@@ -202,6 +211,13 @@ function stepSimulation(sim, dtMs) {
       sim.scenarioState = "STABLE";
       sim.closedTime = t;
     }
+  }
+
+  if (t - sim.lastBacklogSampleTime >= BACKLOG_SAMPLE_MS) {
+    sim.lastBacklogSampleTime = t;
+    const backlog = sim.payments.filter((p) => !p.terminalOutcome).length;
+    sim.backlogHistory.push({ t, backlog, compliancePct: rollingCompliancePct(sim, 30) });
+    if (sim.backlogHistory.length > 60) sim.backlogHistory.shift();
   }
 
   updateAlertLevel(sim, t);
@@ -232,6 +248,18 @@ function fmtClock(ms) {
 function getAffected(sim) {
   const rows = sim.payments.filter((p) => p.riskState !== "WITHIN_SLA" || p.terminalOutcome === "TIMED_OUT");
   return { count: rows.length, value: rows.reduce((sum, p) => sum + p.amount, 0) };
+}
+function rollingCompliancePct(sim, windowSize) {
+  const recent = sim.terminalDurations.slice(-windowSize);
+  if (recent.length === 0) return null;
+  const completed = recent.filter((r) => r.outcome === "COMPLETED").length;
+  return (completed / recent.length) * 100;
+}
+function getPercentiles(durations) {
+  if (durations.length === 0) return null;
+  const sorted = [...durations].sort((a, b) => a - b);
+  const pick = (p) => sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))];
+  return { p50: pick(0.5), p90: pick(0.9), p95: pick(0.95), p99: pick(0.99) };
 }
 function getAffectedByChannel(sim) {
   const rows = sim.payments.filter((p) => p.riskState !== "WITHIN_SLA" || p.terminalOutcome === "TIMED_OUT");
@@ -306,6 +334,256 @@ function ControlRail({ sim, running, onTogglePlay, onInject, onRecover, onReset 
         Synthetic data only. CSM &amp; receiving-bank stages are simulated. SLA defaults (7s / 9s / 10s) are illustrative, pending sign-off.
       </p>
     </aside>
+  );
+}
+
+function Sparkline({ data, color, height = 34, width = 130 }) {
+  if (!data || data.length < 2) {
+    return <div className="sparkline-empty">Not enough data yet</div>;
+  }
+  const values = data.map((d) => d.value);
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const range = max - min || 1;
+  const points = values
+    .map((v, i) => {
+      const x = (i / (values.length - 1)) * width;
+      const y = height - ((v - min) / range) * (height - 4) - 2;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .join(" ");
+  return (
+    <svg viewBox={`0 0 ${width} ${height}`} className="sparkline" preserveAspectRatio="none">
+      <polyline points={points} fill="none" stroke={color} strokeWidth="1.6" />
+    </svg>
+  );
+}
+
+function getExecutiveStatus(sim) {
+  if (sim.scenarioState === "HEALTHY") return { label: "Healthy", color: "var(--status-healthy)", desc: "All instant payments completing within SLA." };
+  if (sim.scenarioState === "RECOVERING") return { label: "Recovering", color: "var(--status-recovering)", desc: "Degradation has ceased — confirming stability before closing." };
+  if (sim.scenarioState === "STABLE") return { label: "Stable", color: "var(--status-healthy)", desc: "Service confirmed stable. Backlog cleared." };
+  if (sim.alertLevel === "CRITICAL" || sim.alertLevel === "BREACH") {
+    return { label: "Impacted", color: "var(--status-breach)", desc: "Customer payments have been timed out or rejected." };
+  }
+  return { label: "Degrading", color: "var(--status-warning)", desc: "Early signs of latency. No confirmed customer impact yet." };
+}
+
+function RecoveryProgress({ sim }) {
+  if (sim.scenarioState !== "RECOVERING" && sim.scenarioState !== "STABLE") {
+    return <div className="empty-state">No recovery in progress.</div>;
+  }
+  const completions = Math.min(3, sim.completedSinceRecovery);
+  const sinceBreach = sim.lastBreachTime != null ? sim.simTime - sim.lastBreachTime : null;
+  return (
+    <div className="recovery-progress">
+      <div className="recovery-progress-row">
+        <span>Clean completions since recovery</span>
+        <strong>{completions} / 3</strong>
+      </div>
+      <div className="recovery-progress-row">
+        <span>Time clear of new breaches</span>
+        <strong>{sinceBreach != null ? `${fmtDuration(Math.min(sinceBreach, STABILITY_GAP_MS))} / ${fmtDuration(STABILITY_GAP_MS)}` : "n/a"}</strong>
+      </div>
+      {sim.scenarioState === "STABLE" && <div className="recovery-progress-done">Confirmed stable.</div>}
+    </div>
+  );
+}
+
+function ExecutiveOverview({ sim }) {
+  const status = getExecutiveStatus(sim);
+  const affected = getAffected(sim);
+  const oldest = getOldestInflightAge(sim);
+  const backlogNow = sim.payments.filter((p) => !p.terminalOutcome).length;
+  const complianceNow = rollingCompliancePct(sim, 30);
+  const complianceSeries = sim.backlogHistory.map((h) => ({ value: h.compliancePct == null ? 100 : h.compliancePct }));
+  const backlogSeries = sim.backlogHistory.map((h) => ({ value: h.backlog }));
+
+  return (
+    <div className="exec-view">
+      <div className="exec-hero" style={{ "--accent": status.color }}>
+        <span className="exec-hero-dot" />
+        <div>
+          <div className="exec-hero-label">{status.label}</div>
+          <div className="exec-hero-desc">{status.desc}</div>
+        </div>
+      </div>
+
+      <div className="exec-grid">
+        <section className="panel">
+          <div className="panel-title">Business impact</div>
+          <div className="exec-impact-row">
+            <div className="exec-stat"><strong>{affected.count}</strong><span>payments affected</span></div>
+            <div className="exec-stat"><strong>{fmtMoney(affected.value)}</strong><span>value exposed</span></div>
+            <div className="exec-stat"><strong>{oldest != null ? fmtDuration(oldest) : "—"}</strong><span>oldest in-flight</span></div>
+          </div>
+        </section>
+
+        <section className="panel">
+          <div className="panel-title">Recovery &amp; stability</div>
+          <RecoveryProgress sim={sim} />
+        </section>
+
+        <section className="panel">
+          <div className="panel-title">SLA compliance — recent 30 payments</div>
+          <div className="exec-trend-row">
+            <div className="exec-trend-value">{complianceNow != null ? `${complianceNow.toFixed(0)}%` : "—"}</div>
+            <Sparkline data={complianceSeries} color="var(--status-healthy)" />
+          </div>
+        </section>
+
+        <section className="panel">
+          <div className="panel-title">Backlog trend</div>
+          <div className="exec-trend-row">
+            <div className="exec-trend-value">{backlogNow}</div>
+            <Sparkline data={backlogSeries} color="var(--gold-300)" />
+          </div>
+        </section>
+      </div>
+    </div>
+  );
+}
+
+function IncidentRecord({ sim }) {
+  const checkpoints = [
+    { label: "First degradation", time: sim.injectionStartTime },
+    { label: "First warning", time: sim.firstWarningTime },
+    { label: "First timeout / rejection", time: sim.firstBreachTime },
+    { label: "Recovery start", time: sim.recoveryStartTime },
+    { label: "Confirmed stable", time: sim.closedTime },
+  ];
+  if (sim.injectionStartTime == null) {
+    return <div className="empty-state">No incident has been raised yet.</div>;
+  }
+  let prevTime = null;
+  return (
+    <table className="data-table">
+      <thead>
+        <tr><th>Checkpoint</th><th>Time</th><th>Since previous</th></tr>
+      </thead>
+      <tbody>
+        {checkpoints.map((c) => {
+          const delta = c.time != null && prevTime != null ? c.time - prevTime : null;
+          if (c.time != null) prevTime = c.time;
+          return (
+            <tr key={c.label}>
+              <td>{c.label}</td>
+              <td className="mono">{c.time != null ? fmtClock(c.time) : "Pending"}</td>
+              <td className="mono">{delta != null ? fmtDuration(delta) : "—"}</td>
+            </tr>
+          );
+        })}
+      </tbody>
+    </table>
+  );
+}
+
+function PercentileTable({ durations }) {
+  const p = getPercentiles(durations);
+  if (!p) return <div className="empty-state">No completed or timed-out payments yet.</div>;
+  return (
+    <div className="percentile-row">
+      <div className="percentile-stat"><span>P50</span><strong>{fmtDuration(p.p50)}</strong></div>
+      <div className="percentile-stat"><span>P90</span><strong>{fmtDuration(p.p90)}</strong></div>
+      <div className="percentile-stat"><span>P95</span><strong>{fmtDuration(p.p95)}</strong></div>
+      <div className="percentile-stat"><span>P99</span><strong>{fmtDuration(p.p99)}</strong></div>
+    </div>
+  );
+}
+
+function BreachStats({ sim }) {
+  const total = sim.terminalDurations.length;
+  const timedOut = sim.terminalDurations.filter((d) => d.outcome === "TIMED_OUT").length;
+  const rate = total > 0 ? (timedOut / total) * 100 : null;
+  const timeInBreach = sim.firstBreachTime != null ? (sim.recoveryStartTime ?? sim.simTime) - sim.firstBreachTime : null;
+  return (
+    <div className="exec-impact-row">
+      <div className="exec-stat"><strong>{timedOut}</strong><span>breach count</span></div>
+      <div className="exec-stat"><strong>{rate != null ? `${rate.toFixed(1)}%` : "—"}</strong><span>breach rate</span></div>
+      <div className="exec-stat"><strong>{fmtDuration(timeInBreach)}</strong><span>time in breach</span></div>
+    </div>
+  );
+}
+
+function ToleranceGauge({ sim }) {
+  if (sim.injectionStartTime == null) {
+    return <div className="empty-state">No incident to measure against tolerance yet.</div>;
+  }
+  const incidentMs = (sim.closedTime ?? sim.simTime) - sim.injectionStartTime;
+  const rawPct = (incidentMs / sim.impactToleranceMs) * 100;
+  const displayPct = Math.min(100, rawPct);
+  const color = rawPct >= 100 ? "var(--status-breach)" : rawPct >= 70 ? "var(--status-warning)" : "var(--status-healthy)";
+  return (
+    <>
+      <div className="tolerance-bar-track">
+        <div className="tolerance-bar-fill" style={{ width: `${displayPct}%`, background: color }} />
+      </div>
+      <div className="tolerance-bar-value mono">
+        {rawPct.toFixed(0)}% of tolerance consumed ({fmtDuration(incidentMs)} / {fmtDuration(sim.impactToleranceMs)})
+      </div>
+    </>
+  );
+}
+
+function ResilienceView({ sim, onSetImpactTolerance }) {
+  const allDurations = sim.terminalDurations.map((d) => d.duration);
+  const complianceOverall = rollingCompliancePct(sim, 200);
+  const backlogSeries = sim.backlogHistory.map((h) => ({ value: h.backlog }));
+
+  return (
+    <div className="resilience-view">
+      <div className="resilience-section-label">Service measures</div>
+      <div className="exec-grid">
+        <section className="panel">
+          <div className="panel-title">Incident record</div>
+          <IncidentRecord sim={sim} />
+        </section>
+        <section className="panel">
+          <div className="panel-title">Recovery evidence</div>
+          <RecoveryProgress sim={sim} />
+          <div className="resilience-subrow">
+            <span>Fraud-stage latency vs baseline</span>
+            <strong className="mono">{fmtDuration(sim.currentFraudLatency)} / {fmtDuration(820)}</strong>
+          </div>
+          <div className="resilience-subrow"><span>Backlog trend</span></div>
+          <Sparkline data={backlogSeries} color="var(--gold-300)" />
+        </section>
+      </div>
+
+      <div className="resilience-section-label">Transaction measures</div>
+      <div className="exec-grid">
+        <section className="panel">
+          <div className="panel-title">Latency percentiles — all terminal payments</div>
+          <PercentileTable durations={allDurations} />
+        </section>
+        <section className="panel">
+          <div className="panel-title">SLA compliance &amp; breach rate</div>
+          <div className="exec-trend-row" style={{ marginBottom: "12px" }}>
+            <div className="exec-trend-value">{complianceOverall != null ? `${complianceOverall.toFixed(0)}%` : "—"}</div>
+            <span className="resilience-caption">overall compliance ({sim.terminalDurations.length} terminal payments)</span>
+          </div>
+          <BreachStats sim={sim} />
+        </section>
+        <section className="panel" style={{ gridColumn: "1 / -1" }}>
+          <div className="panel-title">Impact-tolerance consumption</div>
+          <label className="tolerance-input-row">
+            <span>Impact tolerance (illustrative — pending D-04 sign-off)</span>
+            <span className="tolerance-input-wrap">
+              <input
+                type="number"
+                min="5"
+                step="5"
+                className="tolerance-input"
+                value={Math.round(sim.impactToleranceMs / 1000)}
+                onChange={(e) => onSetImpactTolerance(Math.max(5, Number(e.target.value) || 5) * 1000)}
+              />
+              <span>s</span>
+            </span>
+          </label>
+          <ToleranceGauge sim={sim} />
+        </section>
+      </div>
+    </div>
   );
 }
 
@@ -620,7 +898,7 @@ export default function PaymentsObservabilityPrototype() {
   const simRef = useRef(createInitialSim());
   const [, bump] = useState(0);
   const [running, setRunning] = useState(false);
-  const [activeTab, setActiveTab] = useState("ops");
+  const [activeTab, setActiveTab] = useState("exec");
   const [selectedId, setSelectedId] = useState(null);
 
   useEffect(() => {
@@ -667,6 +945,10 @@ export default function PaymentsObservabilityPrototype() {
     setSelectedId(id);
     setActiveTab("trace");
   }
+  function onSetImpactTolerance(ms) {
+    simRef.current.impactToleranceMs = ms;
+    bump((n) => n + 1);
+  }
 
   return (
     <div className="poc-root">
@@ -688,15 +970,23 @@ export default function PaymentsObservabilityPrototype() {
 
         <main className="poc-main">
           <nav className="poc-tabs">
+            <button className={`poc-tab${activeTab === "exec" ? " poc-tab--active" : ""}`} onClick={() => setActiveTab("exec")}>
+              Executive Payment Health Overview
+            </button>
             <button className={`poc-tab${activeTab === "ops" ? " poc-tab--active" : ""}`} onClick={() => setActiveTab("ops")}>
               Payments Operations Command Centre
             </button>
             <button className={`poc-tab${activeTab === "trace" ? " poc-tab--active" : ""}`} onClick={() => setActiveTab("trace")}>
               Transaction Journey Trace
             </button>
+            <button className={`poc-tab${activeTab === "resilience" ? " poc-tab--active" : ""}`} onClick={() => setActiveTab("resilience")}>
+              SLA &amp; Operational Resilience
+            </button>
           </nav>
 
-          {activeTab === "ops" ? (
+          {activeTab === "exec" && <ExecutiveOverview sim={sim} />}
+
+          {activeTab === "ops" && (
             <div className="ops-view">
               <AlertBanner sim={sim} />
               <section className="panel">
@@ -713,11 +1003,15 @@ export default function PaymentsObservabilityPrototype() {
                 <CohortTable sim={sim} onSelect={selectPayment} />
               </section>
             </div>
-          ) : (
+          )}
+
+          {activeTab === "trace" && (
             <section className="panel panel--flush">
               <TraceView sim={sim} selectedId={selectedId} onSelect={setSelectedId} onBack={() => setActiveTab("ops")} />
             </section>
           )}
+
+          {activeTab === "resilience" && <ResilienceView sim={sim} onSetImpactTolerance={onSetImpactTolerance} />}
         </main>
       </div>
     </div>
@@ -822,6 +1116,43 @@ const CSS = `
 .channel-chip { display: flex; flex-direction: column; gap: 2px; border: 1px solid var(--navy-700); border-radius: 7px; padding: 6px 10px; background: var(--navy-800); }
 .channel-chip-name { font-size: 11px; color: var(--ink-300); }
 .channel-chip-stats { font-size: 12.5px; color: var(--ink-50); }
+
+.exec-view { display: flex; flex-direction: column; gap: 16px; }
+.exec-hero { display: flex; align-items: center; gap: 14px; padding: 20px; border-radius: 10px; border: 1px solid var(--accent); background: var(--navy-900); }
+.exec-hero-dot { width: 14px; height: 14px; border-radius: 50%; background: var(--accent); flex-shrink: 0; }
+.exec-hero-label { font-family: 'Fraunces', serif; font-size: 26px; font-weight: 600; color: var(--accent); }
+.exec-hero-desc { font-size: 13px; color: var(--ink-300); margin-top: 4px; }
+.exec-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+@media (max-width: 760px) { .exec-grid { grid-template-columns: 1fr; } }
+.exec-impact-row { display: flex; gap: 26px; }
+.exec-stat { display: flex; flex-direction: column; gap: 2px; }
+.exec-stat strong { font-family: 'IBM Plex Mono', monospace; font-size: 18px; }
+.exec-stat span { font-size: 10.5px; color: var(--ink-500); }
+.exec-trend-row { display: flex; align-items: center; gap: 16px; }
+.exec-trend-value { font-family: 'IBM Plex Mono', monospace; font-size: 24px; min-width: 62px; }
+.sparkline { flex: 1; height: 36px; }
+.sparkline-empty { font-size: 11px; color: var(--ink-500); }
+.recovery-progress { display: flex; flex-direction: column; gap: 9px; }
+.recovery-progress-row { display: flex; justify-content: space-between; font-size: 12.5px; color: var(--ink-300); }
+.recovery-progress-row strong { color: var(--ink-50); font-family: 'IBM Plex Mono', monospace; }
+.recovery-progress-done { font-size: 12px; color: var(--status-healthy); margin-top: 2px; }
+
+.resilience-view { display: flex; flex-direction: column; gap: 10px; }
+.resilience-section-label { font-size: 11.5px; color: var(--gold-300); font-weight: 600; margin-top: 6px; }
+.resilience-subrow { display: flex; justify-content: space-between; font-size: 12px; color: var(--ink-300); margin: 10px 0 6px; }
+.resilience-subrow strong { color: var(--ink-50); }
+.resilience-caption { font-size: 11px; color: var(--ink-500); }
+.percentile-row { display: flex; gap: 22px; }
+.percentile-stat { display: flex; flex-direction: column; gap: 3px; }
+.percentile-stat span { font-size: 10.5px; color: var(--ink-500); }
+.percentile-stat strong { font-family: 'IBM Plex Mono', monospace; font-size: 16px; }
+.tolerance-input-row { display: flex; align-items: center; justify-content: space-between; font-size: 12.5px; color: var(--ink-300); margin-bottom: 12px; gap: 12px; }
+.tolerance-input-wrap { display: flex; align-items: center; gap: 5px; color: var(--ink-50); flex-shrink: 0; }
+.tolerance-input { width: 64px; background: var(--navy-800); border: 1px solid var(--navy-600); color: var(--ink-50); border-radius: 6px; padding: 4px 6px; font-family: 'IBM Plex Mono', monospace; font-size: 12.5px; }
+.tolerance-input:focus { outline: none; border-color: var(--gold-500); }
+.tolerance-bar-track { position: relative; height: 8px; background: var(--navy-800); border-radius: 4px; margin-bottom: 8px; overflow: hidden; }
+.tolerance-bar-fill { position: absolute; top: 0; left: 0; height: 100%; border-radius: 4px; transition: width 0.2s ease; }
+.tolerance-bar-value { font-size: 11.5px; color: var(--ink-300); }
 
 .alert-banner { display: flex; align-items: center; gap: 16px; padding: 16px 18px; border-radius: 10px; border: 1px solid var(--accent); background: var(--navy-900); }
 .alert-dot { width: 12px; height: 12px; border-radius: 50%; background: var(--accent); flex-shrink: 0; }
