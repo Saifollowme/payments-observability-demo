@@ -17,7 +17,7 @@ const STAGES = [
   { code: "CUSTOMER_NOTIFY", layer: "Clearing & settlement", label: "Customer notify", baseMs: 110, owner: "bank", simulated: false, direction: "out" },
 ];
 
-const SLA = { warning: 7000, critical: 9000, breach: 10000 };
+const DEFAULT_SLA = { warning: 7000, critical: 9000, breach: 10000 };
 const TICK_REAL_MS = 120;
 const TICK_SIM_MS = 120; // 1:1 scale — 10s SLA plays out over 10 real seconds
 const MAX_PAYMENTS = 60;
@@ -74,6 +74,9 @@ function createInitialSim() {
     backlogHistory: [],
     lastBacklogSampleTime: 0,
     impactToleranceMs: 60000,
+    slaWarningMs: DEFAULT_SLA.warning,
+    slaCriticalMs: DEFAULT_SLA.critical,
+    slaBreachMs: DEFAULT_SLA.breach,
   };
 }
 
@@ -115,7 +118,7 @@ function spawnPayment(sim, t) {
     stageEndAt: t + dur,
     riskState: "WITHIN_SLA",
     elapsedMs: 0,
-    remainingBudgetMs: SLA.breach,
+    remainingBudgetMs: sim.slaBreachMs,
     terminalOutcome: null,
     terminalAt: null,
     terminalStageIndex: null,
@@ -178,10 +181,10 @@ function stepSimulation(sim, dtMs) {
 
     const elapsed = t - p.acceptedAt;
     p.elapsedMs = elapsed;
-    p.remainingBudgetMs = Math.max(0, SLA.breach - elapsed);
+    p.remainingBudgetMs = Math.max(0, sim.slaBreachMs - elapsed);
 
     if (!p.terminalOutcome) {
-      if (elapsed >= SLA.breach) {
+      if (elapsed >= sim.slaBreachMs) {
         p.terminalOutcome = "TIMED_OUT";
         p.terminalAt = t;
         p.terminalStageIndex = p.stageIndex;
@@ -193,9 +196,9 @@ function stepSimulation(sim, dtMs) {
         ev.endedAt = t;
         ev.durationMs = t - ev.enteredAt;
         ev.interrupted = true;
-      } else if (elapsed >= SLA.critical) {
+      } else if (elapsed >= sim.slaCriticalMs) {
         p.riskState = "CRITICAL";
-      } else if (elapsed >= SLA.warning) {
+      } else if (elapsed >= sim.slaWarningMs) {
         p.riskState = "AT_RISK";
         if (sim.firstWarningTime == null && sim.injectionStartTime != null) sim.firstWarningTime = t;
       } else {
@@ -295,7 +298,7 @@ function getOldestInflightAge(sim) {
    UI subcomponents
 --------------------------------------------------------------- */
 
-function ControlRail({ sim, running, onTogglePlay, onInject, onRecover, onReset }) {
+function ControlRail({ sim, running, onTogglePlay, onInject, onRecover, onReset, onSetSlaWarning, onSetSlaCritical, onSetSlaBreach }) {
   const canInject = sim.scenarioState === "HEALTHY" || sim.scenarioState === "STABLE";
   const canRecover = sim.scenarioState === "DEGRADING";
 
@@ -343,8 +346,38 @@ function ControlRail({ sim, running, onTogglePlay, onInject, onRecover, onReset 
         </div>
       </div>
 
+      <div className="control-block">
+        <div className="control-title">SLA profile (seconds)</div>
+        <div className="sla-profile-row">
+          <label className="sla-profile-field">
+            <span>Warning</span>
+            <input
+              type="number" min="1" step="0.5"
+              value={sim.slaWarningMs / 1000}
+              onChange={(e) => onSetSlaWarning(Math.max(500, Number(e.target.value) * 1000 || 500))}
+            />
+          </label>
+          <label className="sla-profile-field">
+            <span>Critical</span>
+            <input
+              type="number" min="1" step="0.5"
+              value={sim.slaCriticalMs / 1000}
+              onChange={(e) => onSetSlaCritical(Math.max(500, Number(e.target.value) * 1000 || 500))}
+            />
+          </label>
+          <label className="sla-profile-field">
+            <span>Breach</span>
+            <input
+              type="number" min="1" step="0.5"
+              value={sim.slaBreachMs / 1000}
+              onChange={(e) => onSetSlaBreach(Math.max(500, Number(e.target.value) * 1000 || 500))}
+            />
+          </label>
+        </div>
+      </div>
+
       <p className="control-footnote">
-        Synthetic data only. CSM &amp; receiving-bank stages are simulated. SLA defaults (7s / 9s / 10s) are illustrative, pending sign-off.
+        Synthetic data only. CSM &amp; receiving-bank stages are simulated. SLA values above are illustrative demo defaults, adjustable per AC-17 — not scheme, regulatory or contractual commitments.
       </p>
     </aside>
   );
@@ -802,17 +835,19 @@ function CohortTable({ sim, onSelect }) {
   );
 }
 
-function SlaBar({ payment }) {
+function SlaBar({ payment, sim }) {
   const elapsed = payment.terminalOutcome ? payment.terminalAt - payment.acceptedAt : payment.elapsedMs;
-  const pct = Math.min(100, (elapsed / SLA.breach) * 100);
+  const pct = Math.min(100, (elapsed / sim.slaBreachMs) * 100);
+  const warningPct = (sim.slaWarningMs / sim.slaBreachMs) * 100;
+  const criticalPct = (sim.slaCriticalMs / sim.slaBreachMs) * 100;
   const color = payment.terminalOutcome === "TIMED_OUT" ? "var(--status-breach)" : RISK_META[payment.riskState]?.color || "var(--status-healthy)";
   return (
     <div className="sla-bar">
       <div className="sla-bar-track">
         <div className="sla-bar-fill" style={{ width: `${pct}%`, background: color }} />
-        <div className="sla-marker" style={{ left: "70%" }}><span>7s warn</span></div>
-        <div className="sla-marker" style={{ left: "90%" }}><span>9s critical</span></div>
-        <div className="sla-marker sla-marker--end" style={{ left: "100%" }}><span>10s SLA</span></div>
+        <div className="sla-marker" style={{ left: `${warningPct}%` }}><span>{fmtDuration(sim.slaWarningMs)} warn</span></div>
+        <div className="sla-marker" style={{ left: `${criticalPct}%` }}><span>{fmtDuration(sim.slaCriticalMs)} critical</span></div>
+        <div className="sla-marker sla-marker--end" style={{ left: "100%" }}><span>{fmtDuration(sim.slaBreachMs)} SLA</span></div>
       </div>
       <div className="sla-bar-value mono">{fmtDuration(elapsed)} elapsed</div>
     </div>
@@ -912,7 +947,7 @@ function TraceView({ sim, selectedId, onSelect, onBack }) {
                 <div className="terminal-banner terminal-banner--ok">Completed within SLA.</div>
               )}
             </div>
-            <SlaBar payment={payment} />
+            <SlaBar payment={payment} sim={sim} />
             <StageTimeline payment={payment} simTime={sim.simTime} />
           </>
         )}
@@ -981,6 +1016,21 @@ export default function PaymentsObservabilityPrototype() {
     simRef.current.impactToleranceMs = ms;
     bump((n) => n + 1);
   }
+  function onSetSlaWarning(ms) {
+    const s = simRef.current;
+    s.slaWarningMs = Math.min(ms, s.slaCriticalMs - 500);
+    bump((n) => n + 1);
+  }
+  function onSetSlaCritical(ms) {
+    const s = simRef.current;
+    s.slaCriticalMs = Math.max(s.slaWarningMs + 500, Math.min(ms, s.slaBreachMs - 500));
+    bump((n) => n + 1);
+  }
+  function onSetSlaBreach(ms) {
+    const s = simRef.current;
+    s.slaBreachMs = Math.max(ms, s.slaCriticalMs + 500);
+    bump((n) => n + 1);
+  }
 
   return (
     <div className="poc-root">
@@ -998,7 +1048,7 @@ export default function PaymentsObservabilityPrototype() {
       </header>
 
       <div className="poc-body">
-        <ControlRail sim={sim} running={running} onTogglePlay={onTogglePlay} onInject={onInject} onRecover={onRecover} onReset={onReset} />
+        <ControlRail sim={sim} running={running} onTogglePlay={onTogglePlay} onInject={onInject} onRecover={onRecover} onReset={onReset} onSetSlaWarning={onSetSlaWarning} onSetSlaCritical={onSetSlaCritical} onSetSlaBreach={onSetSlaBreach} />
 
         <main className="poc-main">
           <nav className="poc-tabs">
@@ -1125,6 +1175,10 @@ const CSS = `
 .control-stat { display: flex; justify-content: space-between; font-size: 12px; color: var(--ink-300); }
 .control-stat strong { color: var(--ink-50); font-family: 'IBM Plex Mono', monospace; font-size: 13px; }
 .control-footnote { font-size: 11px; color: var(--ink-500); line-height: 1.5; margin-top: auto; padding-top: 12px; border-top: 1px solid var(--navy-700); }
+.sla-profile-row { display: flex; flex-direction: column; gap: 7px; }
+.sla-profile-field { display: flex; align-items: center; justify-content: space-between; font-size: 11.5px; color: var(--ink-300); }
+.sla-profile-field input { width: 58px; background: var(--navy-800); border: 1px solid var(--navy-600); color: var(--ink-50); border-radius: 6px; padding: 3px 6px; font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; }
+.sla-profile-field input:focus { outline: none; border-color: var(--gold-500); }
 
 .poc-main { padding: 20px 24px; display: flex; flex-direction: column; gap: 16px; overflow-y: auto; }
 .poc-tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--navy-700); }

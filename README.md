@@ -28,6 +28,27 @@ npm run preview   # sanity-check the production build locally
 `npm run build` outputs static files to `dist/` — deployable to any static
 host (GitHub Pages, Netlify, Vercel, S3, etc.).
 
+## Publish to GitHub Pages
+
+One-time setup (already done in this repo, listed here for reference):
+- `vite.config.js` sets `base: "/payments-observability-demo/"` so built
+  asset paths resolve correctly once served from GitHub Pages.
+- `gh-pages` is a dev dependency; `npm run deploy` builds and pushes `dist/`
+  to a `gh-pages` branch.
+
+To publish or re-publish after changes:
+
+```bash
+npm install      # only needed once, or after package.json changes
+npm run deploy
+```
+
+Then, one time only, go to the repo on GitHub → **Settings → Pages** → under
+"Build and deployment," set **Source** to "Deploy from a branch" and
+**Branch** to `gh-pages`. GitHub will show the live URL there, typically
+`https://<your-username>.github.io/payments-observability-demo/`. It can
+take a minute or two to go live the first time.
+
 ## What's in scope
 
 - **Scenario:** fraud-screening latency injected into an instant payment's

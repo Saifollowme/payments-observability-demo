@@ -7,7 +7,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "deploy": "vite build && gh-pages -d dist"
   },
   "dependencies": {
     "react": "^18.3.1",
@@ -16,9 +17,7 @@
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.1",
-    "vite": "^5.4.0"
-  },
-  "allowScripts": {
-    "esbuild@0.21.5": true
+    "vite": "^5.4.0",
+    "gh-pages": "^6.1.1"
   }
 }
