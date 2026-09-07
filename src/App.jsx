@@ -165,7 +165,7 @@ function stepSimulation(sim, dtMs) {
         p.terminalOutcome = "COMPLETED";
         p.terminalAt = t;
         if (sim.scenarioState === "RECOVERING") sim.completedSinceRecovery += 1;
-        sim.terminalDurations.push({ duration: t - p.acceptedAt, outcome: "COMPLETED", t });
+        sim.terminalDurations.push({ duration: t - p.acceptedAt, outcome: "COMPLETED", t, amount: p.amount });
         if (sim.terminalDurations.length > 200) sim.terminalDurations.shift();
         continue;
       }
@@ -187,7 +187,7 @@ function stepSimulation(sim, dtMs) {
         p.terminalStageIndex = p.stageIndex;
         sim.lastBreachTime = t;
         if (sim.firstBreachTime == null) sim.firstBreachTime = t;
-        sim.terminalDurations.push({ duration: elapsed, outcome: "TIMED_OUT", t });
+        sim.terminalDurations.push({ duration: elapsed, outcome: "TIMED_OUT", t, amount: p.amount });
         if (sim.terminalDurations.length > 200) sim.terminalDurations.shift();
         const ev = p.events[p.events.length - 1];
         ev.endedAt = t;
@@ -254,6 +254,19 @@ function rollingCompliancePct(sim, windowSize) {
   if (recent.length === 0) return null;
   const completed = recent.filter((r) => r.outcome === "COMPLETED").length;
   return (completed / recent.length) * 100;
+}
+function getVolumeSummary(sim) {
+  const completed = sim.terminalDurations.filter((d) => d.outcome === "COMPLETED");
+  const timedOut = sim.terminalDurations.filter((d) => d.outcome === "TIMED_OUT");
+  const total = completed.length + timedOut.length;
+  return {
+    total,
+    completedCount: completed.length,
+    completedValue: completed.reduce((s, d) => s + (d.amount || 0), 0),
+    timedOutCount: timedOut.length,
+    timedOutValue: timedOut.reduce((s, d) => s + (d.amount || 0), 0),
+    pctSuccess: total > 0 ? (completed.length / total) * 100 : null,
+  };
 }
 function getPercentiles(durations) {
   if (durations.length === 0) return null;
@@ -394,6 +407,7 @@ function ExecutiveOverview({ sim }) {
   const status = getExecutiveStatus(sim);
   const affected = getAffected(sim);
   const oldest = getOldestInflightAge(sim);
+  const volume = getVolumeSummary(sim);
   const backlogNow = sim.payments.filter((p) => !p.terminalOutcome).length;
   const complianceNow = rollingCompliancePct(sim, 30);
   const complianceSeries = sim.backlogHistory.map((h) => ({ value: h.compliancePct == null ? 100 : h.compliancePct }));
@@ -410,13 +424,31 @@ function ExecutiveOverview({ sim }) {
       </div>
 
       <div className="exec-grid">
-        <section className="panel">
-          <div className="panel-title">Business impact</div>
-          <div className="exec-impact-row">
-            <div className="exec-stat"><strong>{affected.count}</strong><span>payments affected</span></div>
-            <div className="exec-stat"><strong>{fmtMoney(affected.value)}</strong><span>value exposed</span></div>
-            <div className="exec-stat"><strong>{oldest != null ? fmtDuration(oldest) : "—"}</strong><span>oldest in-flight</span></div>
-          </div>
+        <section className="panel" style={{ gridColumn: "1 / -1" }}>
+          <div className="panel-title">Payment volume &amp; value</div>
+          {volume.total === 0 ? (
+            <div className="empty-state">No payments have completed yet.</div>
+          ) : (
+            <div className="volume-split">
+              <div className="volume-group volume-group--good">
+                <div className="volume-group-label">Successful</div>
+                <div className="exec-impact-row">
+                  <div className="exec-stat"><strong>{volume.completedCount}</strong><span>payments</span></div>
+                  <div className="exec-stat"><strong>{fmtMoney(volume.completedValue)}</strong><span>value processed</span></div>
+                  <div className="exec-stat"><strong>{volume.pctSuccess != null ? `${volume.pctSuccess.toFixed(0)}%` : "—"}</strong><span>of total</span></div>
+                </div>
+              </div>
+              <div className="volume-group volume-group--bad">
+                <div className="volume-group-label">Affected</div>
+                <div className="exec-impact-row">
+                  <div className="exec-stat"><strong>{affected.count}</strong><span>payments</span></div>
+                  <div className="exec-stat"><strong>{fmtMoney(affected.value)}</strong><span>value exposed</span></div>
+                  <div className="exec-stat"><strong>{oldest != null ? fmtDuration(oldest) : "—"}</strong><span>oldest in-flight</span></div>
+                </div>
+              </div>
+            </div>
+          )}
+          <div className="volume-total">Total processed: {volume.total} payments</div>
         </section>
 
         <section className="panel">
@@ -1128,6 +1160,13 @@ const CSS = `
 .exec-stat { display: flex; flex-direction: column; gap: 2px; }
 .exec-stat strong { font-family: 'IBM Plex Mono', monospace; font-size: 18px; }
 .exec-stat span { font-size: 10.5px; color: var(--ink-500); }
+
+.volume-split { display: flex; gap: 20px; flex-wrap: wrap; }
+.volume-group { flex: 1; min-width: 220px; padding: 12px 14px; border-radius: 8px; border: 1px solid var(--navy-700); }
+.volume-group--good { border-color: var(--status-healthy); background: rgba(63, 178, 127, 0.06); }
+.volume-group--bad { border-color: var(--status-breach); background: rgba(228, 81, 77, 0.06); }
+.volume-group-label { font-size: 11px; color: var(--ink-300); font-weight: 600; margin-bottom: 8px; }
+.volume-total { font-size: 11px; color: var(--ink-500); margin-top: 12px; }
 .exec-trend-row { display: flex; align-items: center; gap: 16px; }
 .exec-trend-value { font-family: 'IBM Plex Mono', monospace; font-size: 24px; min-width: 62px; }
 .sparkline { flex: 1; height: 36px; }
