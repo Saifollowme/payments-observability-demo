@@ -8,15 +8,15 @@ const SYNECHRON_LOGO = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAOsAAAAwCA
 --------------------------------------------------------------- */
 
 const STAGES = [
-  { code: "CHANNEL_ENTRY", layer: "Initiation", label: "Channel entry", baseMs: 60, owner: "bank", simulated: false, direction: "in" },
-  { code: "AUTH_VALIDATE", layer: "Orchestration", label: "Auth & validate", baseMs: 180, owner: "bank", simulated: false, direction: "internal" },
-  { code: "ENRICH_ROUTE", layer: "Orchestration", label: "Enrich & route", baseMs: 120, owner: "bank", simulated: false, direction: "internal" },
-  { code: "FUNDS_CHECK", layer: "Execution & control", label: "Funds check", baseMs: 220, owner: "bank", simulated: false, direction: "internal" },
-  { code: "FRAUD_SANCTIONS", layer: "Execution & control", label: "Fraud & sanctions", baseMs: 820, owner: "bank", simulated: false, direction: "internal" },
-  { code: "EXECUTION_POST", layer: "Execution & control", label: "Ledger posting", baseMs: 160, owner: "bank", simulated: false, direction: "internal" },
-  { code: "SCHEME_SUBMIT", layer: "Clearing & settlement", label: "Scheme adapter", baseMs: 220, owner: "csm", simulated: true, direction: "out" },
-  { code: "RECEIVING_RESPONSE", layer: "Clearing & settlement", label: "Receiving bank", baseMs: 320, owner: "receiving", simulated: true, direction: "in" },
-  { code: "CUSTOMER_NOTIFY", layer: "Clearing & settlement", label: "Customer notify", baseMs: 110, owner: "bank", simulated: false, direction: "out" },
+  { code: "CHANNEL_ENTRY", layer: "Initiation", label: "Channel entry", baseMs: 60, stageSlaMs: 300, owner: "bank", simulated: false, direction: "in" },
+  { code: "AUTH_VALIDATE", layer: "Orchestration", label: "Auth & validate", baseMs: 180, stageSlaMs: 500, owner: "bank", simulated: false, direction: "internal" },
+  { code: "ENRICH_ROUTE", layer: "Orchestration", label: "Enrich & route", baseMs: 120, stageSlaMs: 400, owner: "bank", simulated: false, direction: "internal" },
+  { code: "FUNDS_CHECK", layer: "Execution & control", label: "Funds check", baseMs: 220, stageSlaMs: 600, owner: "bank", simulated: false, direction: "internal" },
+  { code: "COMPLIANCE_SCREENING", layer: "Execution & control", label: "Compliance & screening", baseMs: 820, stageSlaMs: 3000, owner: "bank", simulated: false, direction: "internal" },
+  { code: "EXECUTION_POST", layer: "Execution & control", label: "Ledger posting", baseMs: 160, stageSlaMs: 450, owner: "bank", simulated: false, direction: "internal" },
+  { code: "NETWORK_GATEWAY", layer: "Clearing & settlement", label: "Network gateway", baseMs: 220, stageSlaMs: 600, owner: "network", simulated: true, direction: "out" },
+  { code: "BENEFICIARY_RESPONSE", layer: "Clearing & settlement", label: "Beneficiary institution", baseMs: 320, stageSlaMs: 900, owner: "beneficiary", simulated: true, direction: "in" },
+  { code: "CUSTOMER_NOTIFY", layer: "Clearing & settlement", label: "Customer notify", baseMs: 110, stageSlaMs: 350, owner: "bank", simulated: false, direction: "out" },
 ];
 
 const DEFAULT_SLA = { warning: 7000, critical: 9000, breach: 10000 };
@@ -68,7 +68,7 @@ function createInitialSim() {
     firstBreachTime: null,
     completedSinceRecovery: 0,
     latencyAtRecoveryStart: 820,
-    currentFraudLatency: 820,
+    currentScreeningLatency: 820,
     alertLevel: "NONE",
     alertLevelSince: 0,
     lastBreachTime: null,
@@ -79,6 +79,14 @@ function createInitialSim() {
     slaWarningMs: DEFAULT_SLA.warning,
     slaCriticalMs: DEFAULT_SLA.critical,
     slaBreachMs: DEFAULT_SLA.breach,
+    tpsCapacity: 1.0,
+    priorPeriod: {
+      label: "Prior period (illustrative baseline)",
+      volume: 12450,
+      compliancePct: 96.2,
+      breachRatePct: 2.1,
+      totalValue: 2380000,
+    },
   };
 }
 
@@ -86,7 +94,7 @@ function jitter(ms) {
   return ms * (0.85 + Math.random() * 0.3);
 }
 
-function fraudLatencyTarget(sim, t) {
+function screeningLatencyTarget(sim, t) {
   const base = 820;
   if (sim.scenarioState === "DEGRADING" && sim.injectionStartTime != null) {
     const sec = (t - sim.injectionStartTime) / 1000;
@@ -155,7 +163,7 @@ function stepSimulation(sim, dtMs) {
     spawnPayment(sim, t);
   }
 
-  sim.currentFraudLatency = fraudLatencyTarget(sim, t);
+  sim.currentScreeningLatency = screeningLatencyTarget(sim, t);
 
   for (const p of sim.payments) {
     if (p.terminalOutcome) continue;
@@ -175,7 +183,7 @@ function stepSimulation(sim, dtMs) {
         continue;
       }
       const stage = STAGES[p.stageIndex];
-      const target = stage.code === "FRAUD_SANCTIONS" ? sim.currentFraudLatency : stage.baseMs;
+      const target = stage.code === "COMPLIANCE_SCREENING" ? sim.currentScreeningLatency : stage.baseMs;
       const dur = jitter(target);
       p.stageEndAt = t + dur;
       p.events.push({ stage: stage.code, enteredAt: t, endedAt: null, durationMs: null, baseMs: stage.baseMs, plannedMs: dur });
@@ -221,7 +229,7 @@ function stepSimulation(sim, dtMs) {
   if (t - sim.lastBacklogSampleTime >= BACKLOG_SAMPLE_MS) {
     sim.lastBacklogSampleTime = t;
     const backlog = sim.payments.filter((p) => !p.terminalOutcome).length;
-    sim.backlogHistory.push({ t, backlog, compliancePct: rollingCompliancePct(sim, 30) });
+    sim.backlogHistory.push({ t, backlog, compliancePct: rollingCompliancePct(sim, 30), tps: getCurrentTPS(sim, t, 5) });
     if (sim.backlogHistory.length > 60) sim.backlogHistory.shift();
   }
 
@@ -259,6 +267,16 @@ function rollingCompliancePct(sim, windowSize) {
   if (recent.length === 0) return null;
   const completed = recent.filter((r) => r.outcome === "COMPLETED").length;
   return (completed / recent.length) * 100;
+}
+function getCurrentTPS(sim, atTime, windowSec) {
+  const windowMs = windowSec * 1000;
+  const recent = sim.terminalDurations.filter((d) => atTime - d.t <= windowMs && atTime - d.t >= 0);
+  return recent.length / windowSec;
+}
+function getTpsBand(tps, capacity) {
+  if (tps >= capacity * 0.8) return "GOOD";
+  if (tps >= capacity * 0.5) return "WARNING";
+  return "BREACHED";
 }
 function getVolumeSummary(sim) {
   const completed = sim.terminalDurations.filter((d) => d.outcome === "COMPLETED");
@@ -300,7 +318,7 @@ function getOldestInflightAge(sim) {
    UI subcomponents
 --------------------------------------------------------------- */
 
-function ControlRail({ sim, running, onTogglePlay, onInject, onRecover, onReset, onSetSlaWarning, onSetSlaCritical, onSetSlaBreach }) {
+function ControlRail({ sim, running, onTogglePlay, onInject, onRecover, onReset, onSetSlaWarning, onSetSlaCritical, onSetSlaBreach, onSetTpsCapacity }) {
   const canInject = sim.scenarioState === "HEALTHY" || sim.scenarioState === "STABLE";
   const canRecover = sim.scenarioState === "DEGRADING";
 
@@ -321,7 +339,7 @@ function ControlRail({ sim, running, onTogglePlay, onInject, onRecover, onReset,
         </button>
         <button className="control-btn control-btn--warn" onClick={onInject} disabled={!canInject}>
           <AlertTriangle size={15} />
-          Inject fraud-screening latency
+          Inject compliance-screening latency
         </button>
         <button className="control-btn control-btn--recover" onClick={onRecover} disabled={!canRecover}>
           <CheckCircle2 size={15} />
@@ -378,8 +396,20 @@ function ControlRail({ sim, running, onTogglePlay, onInject, onRecover, onReset,
         </div>
       </div>
 
+      <div className="control-block">
+        <div className="control-title">Throughput capacity (TPS)</div>
+        <label className="sla-profile-field">
+          <span>Nominal capacity</span>
+          <input
+            type="number" min="0.1" step="0.1"
+            value={sim.tpsCapacity}
+            onChange={(e) => onSetTpsCapacity(Math.max(0.1, Number(e.target.value) || 0.1))}
+          />
+        </label>
+      </div>
+
       <p className="control-footnote">
-        Synthetic data only. CSM &amp; receiving-bank stages are simulated. SLA values above are illustrative demo defaults, adjustable per AC-17 — not scheme, regulatory or contractual commitments.
+        Synthetic data only. Clearing-network &amp; beneficiary-institution stages are simulated. SLA values above are illustrative demo defaults, adjustable per AC-17 — not scheme, regulatory or contractual commitments.
       </p>
     </aside>
   );
@@ -434,79 +464,6 @@ function RecoveryProgress({ sim }) {
         <strong>{sinceBreach != null ? `${fmtDuration(Math.min(sinceBreach, STABILITY_GAP_MS))} / ${fmtDuration(STABILITY_GAP_MS)}` : "n/a"}</strong>
       </div>
       {sim.scenarioState === "STABLE" && <div className="recovery-progress-done">Confirmed stable.</div>}
-    </div>
-  );
-}
-
-function ExecutiveOverview({ sim }) {
-  const status = getExecutiveStatus(sim);
-  const affected = getAffected(sim);
-  const oldest = getOldestInflightAge(sim);
-  const volume = getVolumeSummary(sim);
-  const backlogNow = sim.payments.filter((p) => !p.terminalOutcome).length;
-  const complianceNow = rollingCompliancePct(sim, 30);
-  const complianceSeries = sim.backlogHistory.map((h) => ({ value: h.compliancePct == null ? 100 : h.compliancePct }));
-  const backlogSeries = sim.backlogHistory.map((h) => ({ value: h.backlog }));
-
-  return (
-    <div className="exec-view">
-      <div className="exec-hero" style={{ "--accent": status.color }}>
-        <span className="exec-hero-dot" />
-        <div>
-          <div className="exec-hero-label">{status.label}</div>
-          <div className="exec-hero-desc">{status.desc}</div>
-        </div>
-      </div>
-
-      <div className="exec-grid">
-        <section className="panel" style={{ gridColumn: "1 / -1" }}>
-          <div className="panel-title">Payment volume &amp; value</div>
-          {volume.total === 0 ? (
-            <div className="empty-state">No payments have completed yet.</div>
-          ) : (
-            <div className="volume-split">
-              <div className="volume-group volume-group--good">
-                <div className="volume-group-label">Successful</div>
-                <div className="exec-impact-row">
-                  <div className="exec-stat"><strong>{volume.completedCount}</strong><span>payments</span></div>
-                  <div className="exec-stat"><strong>{fmtMoney(volume.completedValue)}</strong><span>value processed</span></div>
-                  <div className="exec-stat"><strong>{volume.pctSuccess != null ? `${volume.pctSuccess.toFixed(0)}%` : "—"}</strong><span>of total</span></div>
-                </div>
-              </div>
-              <div className="volume-group volume-group--bad">
-                <div className="volume-group-label">Affected</div>
-                <div className="exec-impact-row">
-                  <div className="exec-stat"><strong>{affected.count}</strong><span>payments</span></div>
-                  <div className="exec-stat"><strong>{fmtMoney(affected.value)}</strong><span>value exposed</span></div>
-                  <div className="exec-stat"><strong>{oldest != null ? fmtDuration(oldest) : "—"}</strong><span>oldest in-flight</span></div>
-                </div>
-              </div>
-            </div>
-          )}
-          <div className="volume-total">Total processed: {volume.total} payments</div>
-        </section>
-
-        <section className="panel">
-          <div className="panel-title">Recovery &amp; stability</div>
-          <RecoveryProgress sim={sim} />
-        </section>
-
-        <section className="panel">
-          <div className="panel-title">SLA compliance — recent 30 payments</div>
-          <div className="exec-trend-row">
-            <div className="exec-trend-value">{complianceNow != null ? `${complianceNow.toFixed(0)}%` : "—"}</div>
-            <Sparkline data={complianceSeries} color="var(--status-healthy)" />
-          </div>
-        </section>
-
-        <section className="panel">
-          <div className="panel-title">Backlog trend</div>
-          <div className="exec-trend-row">
-            <div className="exec-trend-value">{backlogNow}</div>
-            <Sparkline data={backlogSeries} color="var(--gold-300)" />
-          </div>
-        </section>
-      </div>
     </div>
   );
 }
@@ -592,37 +549,155 @@ function ToleranceGauge({ sim }) {
   );
 }
 
-function ResilienceView({ sim, onSetImpactTolerance }) {
-  const allDurations = sim.terminalDurations.map((d) => d.duration);
-  const complianceOverall = rollingCompliancePct(sim, 200);
-  const backlogSeries = sim.backlogHistory.map((h) => ({ value: h.backlog }));
+const TPS_META = {
+  GOOD: { label: "Good", color: "var(--status-healthy)" },
+  WARNING: { label: "Warning", color: "var(--status-warning)" },
+  BREACHED: { label: "Breached", color: "var(--status-breach)" },
+};
+
+function ThroughputPanel({ sim }) {
+  const hasData = sim.terminalDurations.length >= 3;
+  const currentTps = getCurrentTPS(sim, sim.simTime, 5);
+  const band = hasData ? getTpsBand(currentTps, sim.tpsCapacity) : "PENDING";
+  const meta = hasData ? TPS_META[band] : { label: "Awaiting data", color: "var(--status-info)" };
+  const series = sim.backlogHistory.map((h) => ({ value: h.tps }));
+  return (
+    <>
+      <div className="tps-band-row">
+        <span className="tps-chip" style={{ "--chip-color": meta.color }}>{meta.label}</span>
+        <div className="exec-trend-value">{hasData ? currentTps.toFixed(1) : "—"}<span className="tps-unit"> TPS</span></div>
+      </div>
+      {hasData ? (
+        <Sparkline data={series} color={meta.color} />
+      ) : (
+        <div className="sparkline-empty">Fewer than 3 payments completed so far — throughput reading not yet reliable.</div>
+      )}
+      <div className="resilience-caption">Capacity band: {sim.tpsCapacity.toFixed(1)} TPS nominal (Good ≥80%, Warning 50–80%, Breached &lt;50%) — distinct from per-payment SLA state.</div>
+    </>
+  );
+}
+
+function PeriodComparison({ sim }) {
+  const volume = getVolumeSummary(sim);
+  const compliance = rollingCompliancePct(sim, 200);
+  const breachRate = volume.total > 0 ? (volume.timedOutCount / volume.total) * 100 : null;
+  const prior = sim.priorPeriod;
+  const complianceDelta = compliance != null ? compliance - prior.compliancePct : null;
+  const breachDelta = breachRate != null ? breachRate - prior.breachRatePct : null;
 
   return (
-    <div className="resilience-view">
-      <div className="resilience-section-label">Service measures</div>
+    <div>
+      <div className="resilience-caption" style={{ marginBottom: "10px" }}>
+        Comparing this live session against an illustrative prior-period baseline — not real historical data.
+      </div>
+      <table className="data-table">
+        <thead>
+          <tr><th>Measure</th><th>{prior.label}</th><th>Current session (live)</th><th>Δ</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Volume processed</td>
+            <td className="mono">{prior.volume.toLocaleString()}</td>
+            <td className="mono">{volume.total}</td>
+            <td className="mono">n/a — scale differs</td>
+          </tr>
+          <tr>
+            <td>Value processed</td>
+            <td className="mono">{fmtMoney(prior.totalValue)}</td>
+            <td className="mono">{fmtMoney(volume.completedValue)}</td>
+            <td className="mono">n/a — scale differs</td>
+          </tr>
+          <tr>
+            <td>SLA compliance</td>
+            <td className="mono">{prior.compliancePct.toFixed(1)}%</td>
+            <td className="mono">{compliance != null ? `${compliance.toFixed(1)}%` : "—"}</td>
+            <td className="mono">{complianceDelta != null ? `${complianceDelta >= 0 ? "▲" : "▼"} ${Math.abs(complianceDelta).toFixed(1)}pp` : "—"}</td>
+          </tr>
+          <tr>
+            <td>Breach rate</td>
+            <td className="mono">{prior.breachRatePct.toFixed(1)}%</td>
+            <td className="mono">{breachRate != null ? `${breachRate.toFixed(1)}%` : "—"}</td>
+            <td className="mono">{breachDelta != null ? `${breachDelta <= 0 ? "▼" : "▲"} ${Math.abs(breachDelta).toFixed(1)}pp` : "—"}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function BusinessResilienceView({ sim, onSetImpactTolerance }) {
+  const status = getExecutiveStatus(sim);
+  const affected = getAffected(sim);
+  const oldest = getOldestInflightAge(sim);
+  const volume = getVolumeSummary(sim);
+  const complianceOverall = rollingCompliancePct(sim, 200);
+  const backlogSeries = sim.backlogHistory.map((h) => ({ value: h.backlog }));
+  const allDurations = sim.terminalDurations.map((d) => d.duration);
+
+  return (
+    <div className="exec-view">
+      <div className="exec-hero" style={{ "--accent": status.color }}>
+        <span className="exec-hero-dot" />
+        <div>
+          <div className="exec-hero-label">{status.label}</div>
+          <div className="exec-hero-desc">{status.desc}</div>
+        </div>
+      </div>
+
       <div className="exec-grid">
-        <section className="panel">
-          <div className="panel-title">Incident record</div>
-          <IncidentRecord sim={sim} />
+        <section className="panel" style={{ gridColumn: "1 / -1" }}>
+          <div className="panel-title">Payment volume &amp; value</div>
+          {volume.total === 0 ? (
+            <div className="empty-state">No payments have completed yet.</div>
+          ) : (
+            <div className="volume-split">
+              <div className="volume-group volume-group--good">
+                <div className="volume-group-label">Successful</div>
+                <div className="exec-impact-row">
+                  <div className="exec-stat"><strong>{volume.completedCount}</strong><span>payments</span></div>
+                  <div className="exec-stat"><strong>{fmtMoney(volume.completedValue)}</strong><span>value processed</span></div>
+                  <div className="exec-stat"><strong>{volume.pctSuccess != null ? `${volume.pctSuccess.toFixed(0)}%` : "—"}</strong><span>of total</span></div>
+                </div>
+              </div>
+              <div className="volume-group volume-group--bad">
+                <div className="volume-group-label">Affected</div>
+                <div className="exec-impact-row">
+                  <div className="exec-stat"><strong>{affected.count}</strong><span>payments</span></div>
+                  <div className="exec-stat"><strong>{fmtMoney(affected.value)}</strong><span>value exposed</span></div>
+                  <div className="exec-stat"><strong>{oldest != null ? fmtDuration(oldest) : "—"}</strong><span>oldest in-flight</span></div>
+                </div>
+              </div>
+            </div>
+          )}
+          <div className="volume-total">Total processed: {volume.total} payments</div>
         </section>
+
         <section className="panel">
-          <div className="panel-title">Recovery evidence</div>
+          <div className="panel-title">Throughput (TPS)</div>
+          <ThroughputPanel sim={sim} />
+        </section>
+
+        <section className="panel">
+          <div className="panel-title">Recovery &amp; stability</div>
           <RecoveryProgress sim={sim} />
           <div className="resilience-subrow">
-            <span>Fraud-stage latency vs baseline</span>
-            <strong className="mono">{fmtDuration(sim.currentFraudLatency)} / {fmtDuration(820)}</strong>
+            <span>Compliance-screening latency vs baseline</span>
+            <strong className="mono">{fmtDuration(sim.currentScreeningLatency)} / {fmtDuration(820)}</strong>
           </div>
           <div className="resilience-subrow"><span>Backlog trend</span></div>
           <Sparkline data={backlogSeries} color="var(--gold-300)" />
         </section>
-      </div>
 
-      <div className="resilience-section-label">Transaction measures</div>
-      <div className="exec-grid">
+        <section className="panel">
+          <div className="panel-title">Incident record</div>
+          <IncidentRecord sim={sim} />
+        </section>
+
         <section className="panel">
           <div className="panel-title">Latency percentiles — all terminal payments</div>
           <PercentileTable durations={allDurations} />
         </section>
+
         <section className="panel">
           <div className="panel-title">SLA compliance &amp; breach rate</div>
           <div className="exec-trend-row" style={{ marginBottom: "12px" }}>
@@ -631,6 +706,7 @@ function ResilienceView({ sim, onSetImpactTolerance }) {
           </div>
           <BreachStats sim={sim} />
         </section>
+
         <section className="panel" style={{ gridColumn: "1 / -1" }}>
           <div className="panel-title">Impact-tolerance consumption</div>
           <label className="tolerance-input-row">
@@ -648,6 +724,11 @@ function ResilienceView({ sim, onSetImpactTolerance }) {
             </span>
           </label>
           <ToleranceGauge sim={sim} />
+        </section>
+
+        <section className="panel" style={{ gridColumn: "1 / -1" }}>
+          <div className="panel-title">Period-over-period comparison (MIS)</div>
+          <PeriodComparison sim={sim} />
         </section>
       </div>
     </div>
@@ -698,13 +779,13 @@ function PipelineFlow({ sim, onSelect, selectedId }) {
         {segments.map((seg) => (
           <div
             key={seg.code}
-            className={`pipeline-segment pipeline-segment--${seg.owner}${seg.code === "FRAUD_SANCTIONS" && sim.scenarioState !== "HEALTHY" ? " pipeline-segment--watched" : ""}`}
+            className={`pipeline-segment pipeline-segment--${seg.owner}${seg.code === "COMPLIANCE_SCREENING" && sim.scenarioState !== "HEALTHY" ? " pipeline-segment--watched" : ""}`}
             style={{ left: `${seg.start * 100}%`, width: `${(seg.end - seg.start) * 100}%` }}
           >
             <span className="pipeline-segment-label">{seg.label}</span>
             {seg.simulated && <span className="pipeline-segment-tag">Simulated</span>}
-            {seg.code === "FRAUD_SANCTIONS" && sim.scenarioState !== "HEALTHY" && (
-              <span className="pipeline-live-metric">{fmtDuration(sim.currentFraudLatency)} now</span>
+            {seg.code === "COMPLIANCE_SCREENING" && sim.scenarioState !== "HEALTHY" && (
+              <span className="pipeline-live-metric">{fmtDuration(sim.currentScreeningLatency)} now</span>
             )}
           </div>
         ))}
@@ -872,6 +953,10 @@ function StageTimeline({ payment, simTime }) {
         }
         const ev = payment.events[i];
         const duration = ev ? (ev.durationMs != null ? ev.durationMs : simTime - ev.enteredAt) : null;
+        const stageSlaState =
+          duration == null ? null :
+          duration > s.stageSlaMs ? "exceeded" :
+          duration > s.stageSlaMs * 0.7 ? "approaching" : "within";
 
         return (
           <li key={s.code} className={`timeline-item timeline-item--${status}`}>
@@ -893,12 +978,33 @@ function StageTimeline({ payment, simTime }) {
                   </>
                 )}
               </div>
+              {stageSlaState != null && stageSlaState !== "within" && (
+                <div className={`timeline-stage-sla timeline-stage-sla--${stageSlaState}`}>
+                  {stageSlaState === "exceeded" ? "Stage SLA exceeded" : "Approaching stage SLA"} ({fmtDuration(s.stageSlaMs)} threshold)
+                </div>
+              )}
             </div>
           </li>
         );
       })}
     </ol>
   );
+}
+
+function getMostConsumingStage(payment) {
+  let worst = null;
+  let worstRatio = 0;
+  for (let i = 0; i < payment.events.length; i++) {
+    const ev = payment.events[i];
+    if (ev.durationMs == null) continue;
+    const stage = STAGES[i];
+    const ratio = ev.durationMs / stage.stageSlaMs;
+    if (ratio > worstRatio) {
+      worstRatio = ratio;
+      worst = { stage, durationMs: ev.durationMs };
+    }
+  }
+  return worst;
 }
 
 function TraceView({ sim, selectedId, onSelect, onBack }) {
@@ -942,7 +1048,7 @@ function TraceView({ sim, selectedId, onSelect, onBack }) {
               </div>
               {payment.terminalOutcome === "TIMED_OUT" && (
                 <div className="terminal-banner">
-                  Timed out at {STAGES[payment.terminalStageIndex]?.label} — did not proceed to the scheme adapter or clearing path.
+                  Timed out at {STAGES[payment.terminalStageIndex]?.label} — did not proceed to the network gateway or clearing path.
                 </div>
               )}
               {payment.terminalOutcome === "COMPLETED" && (
@@ -950,6 +1056,14 @@ function TraceView({ sim, selectedId, onSelect, onBack }) {
               )}
             </div>
             <SlaBar payment={payment} sim={sim} />
+            {(() => {
+              const worst = getMostConsumingStage(payment);
+              return worst ? (
+                <div className="most-consuming-stage">
+                  Most SLA-consuming stage: <strong>{worst.stage.label}</strong> ({fmtDuration(worst.durationMs)} of {fmtDuration(worst.stage.stageSlaMs)} stage budget)
+                </div>
+              ) : null;
+            })()}
             <StageTimeline payment={payment} simTime={sim.simTime} />
           </>
         )}
@@ -967,7 +1081,8 @@ export default function PaymentsObservabilityPrototype() {
   const simRef = useRef(createInitialSim());
   const [, bump] = useState(0);
   const [running, setRunning] = useState(false);
-  const [activeTab, setActiveTab] = useState("exec");
+  const [activeTab, setActiveTab] = useState("business");
+  const [opsView, setOpsView] = useState("monitor");
   const [selectedId, setSelectedId] = useState(null);
 
   useEffect(() => {
@@ -997,7 +1112,7 @@ export default function PaymentsObservabilityPrototype() {
   }
   function onRecover() {
     const s = simRef.current;
-    s.latencyAtRecoveryStart = fraudLatencyTarget(s, s.simTime);
+    s.latencyAtRecoveryStart = screeningLatencyTarget(s, s.simTime);
     s.scenarioState = "RECOVERING";
     s.recoveryStartTime = s.simTime;
     s.completedSinceRecovery = 0;
@@ -1007,12 +1122,13 @@ export default function PaymentsObservabilityPrototype() {
     simRef.current = createInitialSim();
     setRunning(false);
     setSelectedId(null);
-    setActiveTab("ops");
+    setActiveTab("business");
+    setOpsView("monitor");
     bump((n) => n + 1);
   }
   function selectPayment(id) {
     setSelectedId(id);
-    setActiveTab("trace");
+    setOpsView("trace");
   }
   function onSetImpactTolerance(ms) {
     simRef.current.impactToleranceMs = ms;
@@ -1033,6 +1149,10 @@ export default function PaymentsObservabilityPrototype() {
     s.slaBreachMs = Math.max(ms, s.slaCriticalMs + 500);
     bump((n) => n + 1);
   }
+  function onSetTpsCapacity(v) {
+    simRef.current.tpsCapacity = v;
+    bump((n) => n + 1);
+  }
 
   return (
     <div className="poc-root">
@@ -1043,7 +1163,7 @@ export default function PaymentsObservabilityPrototype() {
           <img src={SYNECHRON_LOGO} alt="Synechron" className="poc-logo" />
           <div>
             <div className="poc-title">Real-Time Payment SLA &amp; Journey Observability</div>
-            <div className="poc-subtitle">Scenario: Instant-payment fraud &amp; sanctions screening latency degradation</div>
+            <div className="poc-subtitle">Scenario: Instant-payment compliance-screening latency degradation</div>
           </div>
         </div>
         <div className="poc-clock mono">
@@ -1053,27 +1173,24 @@ export default function PaymentsObservabilityPrototype() {
       </header>
 
       <div className="poc-body">
-        <ControlRail sim={sim} running={running} onTogglePlay={onTogglePlay} onInject={onInject} onRecover={onRecover} onReset={onReset} onSetSlaWarning={onSetSlaWarning} onSetSlaCritical={onSetSlaCritical} onSetSlaBreach={onSetSlaBreach} />
+        <ControlRail sim={sim} running={running} onTogglePlay={onTogglePlay} onInject={onInject} onRecover={onRecover} onReset={onReset} onSetSlaWarning={onSetSlaWarning} onSetSlaCritical={onSetSlaCritical} onSetSlaBreach={onSetSlaBreach} onSetTpsCapacity={onSetTpsCapacity} />
 
         <main className="poc-main">
           <nav className="poc-tabs">
-            <button className={`poc-tab${activeTab === "exec" ? " poc-tab--active" : ""}`} onClick={() => setActiveTab("exec")}>
-              Executive Payment Health Overview
+            <button className={`poc-tab${activeTab === "business" ? " poc-tab--active" : ""}`} onClick={() => setActiveTab("business")}>
+              Business &amp; Resilience
             </button>
-            <button className={`poc-tab${activeTab === "ops" ? " poc-tab--active" : ""}`} onClick={() => setActiveTab("ops")}>
-              Payments Operations Command Centre
-            </button>
-            <button className={`poc-tab${activeTab === "trace" ? " poc-tab--active" : ""}`} onClick={() => setActiveTab("trace")}>
-              Transaction Journey Trace
-            </button>
-            <button className={`poc-tab${activeTab === "resilience" ? " poc-tab--active" : ""}`} onClick={() => setActiveTab("resilience")}>
-              SLA &amp; Operational Resilience
+            <button
+              className={`poc-tab${activeTab === "operations" ? " poc-tab--active" : ""}`}
+              onClick={() => { setActiveTab("operations"); setOpsView("monitor"); }}
+            >
+              Operations &amp; Investigation
             </button>
           </nav>
 
-          {activeTab === "exec" && <ExecutiveOverview sim={sim} />}
+          {activeTab === "business" && <BusinessResilienceView sim={sim} onSetImpactTolerance={onSetImpactTolerance} />}
 
-          {activeTab === "ops" && (
+          {activeTab === "operations" && opsView === "monitor" && (
             <div className="ops-view">
               <AlertBanner sim={sim} />
               <section className="panel">
@@ -1092,13 +1209,11 @@ export default function PaymentsObservabilityPrototype() {
             </div>
           )}
 
-          {activeTab === "trace" && (
+          {activeTab === "operations" && opsView === "trace" && (
             <section className="panel panel--flush">
-              <TraceView sim={sim} selectedId={selectedId} onSelect={setSelectedId} onBack={() => setActiveTab("ops")} />
+              <TraceView sim={sim} selectedId={selectedId} onSelect={setSelectedId} onBack={() => setOpsView("monitor")} />
             </section>
           )}
-
-          {activeTab === "resilience" && <ResilienceView sim={sim} onSetImpactTolerance={onSetImpactTolerance} />}
         </main>
       </div>
     </div>
@@ -1242,6 +1357,9 @@ const CSS = `
 .resilience-subrow { display: flex; justify-content: space-between; font-size: 12px; color: var(--ink-300); margin: 10px 0 6px; }
 .resilience-subrow strong { color: var(--ink-50); }
 .resilience-caption { font-size: 11px; color: var(--ink-500); }
+.tps-band-row { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+.tps-chip { border: 1px solid var(--chip-color); color: var(--chip-color); border-radius: 20px; padding: 3px 11px; font-size: 12px; font-weight: 500; }
+.tps-unit { font-size: 13px; color: var(--ink-500); font-weight: 400; }
 .percentile-row { display: flex; gap: 22px; }
 .percentile-stat { display: flex; flex-direction: column; gap: 3px; }
 .percentile-stat span { font-size: 10.5px; color: var(--ink-500); }
@@ -1269,7 +1387,7 @@ const CSS = `
 
 .pipeline-track { position: relative; height: 92px; background: var(--navy-800); border-radius: 8px; border: 1px solid var(--navy-700); overflow: hidden; margin-bottom: 10px; }
 .pipeline-segment { position: absolute; top: 0; bottom: 0; border-right: 1px solid var(--navy-700); padding: 6px 7px; box-sizing: border-box; overflow: hidden; }
-.pipeline-segment--csm, .pipeline-segment--receiving { background: repeating-linear-gradient(135deg, rgba(255,255,255,0.025) 0 8px, transparent 8px 16px); }
+.pipeline-segment--network, .pipeline-segment--beneficiary { background: repeating-linear-gradient(135deg, rgba(255,255,255,0.025) 0 8px, transparent 8px 16px); }
 .pipeline-segment--watched { background: rgba(232,118,59,0.10); }
 .pipeline-segment-label { display: block; font-size: 9.5px; line-height: 1.25; color: var(--ink-300); }
 .pipeline-segment-tag { display: inline-block; margin-top: 3px; font-size: 8.5px; color: var(--gold-300); border: 1px solid var(--gold-500); border-radius: 8px; padding: 0 5px; white-space: nowrap; }
@@ -1323,4 +1441,9 @@ const CSS = `
 .timeline-tag { font-size: 9.5px; color: var(--gold-300); border: 1px solid var(--gold-500); border-radius: 10px; padding: 1px 6px; }
 .timeline-dir { font-size: 10px; color: var(--ink-500); margin-left: auto; }
 .timeline-meta { font-size: 11.5px; color: var(--ink-300); margin-top: 2px; }
+.timeline-stage-sla { font-size: 10.5px; margin-top: 3px; padding: 2px 7px; border-radius: 4px; display: inline-block; }
+.timeline-stage-sla--approaching { color: var(--status-warning); background: rgba(232,169,59,0.12); }
+.timeline-stage-sla--exceeded { color: var(--status-breach); background: rgba(228,81,77,0.12); }
+.most-consuming-stage { font-size: 12px; color: var(--ink-300); margin-bottom: 14px; padding: 8px 12px; background: var(--navy-800); border-radius: 7px; }
+.most-consuming-stage strong { color: var(--gold-300); }
 `;
